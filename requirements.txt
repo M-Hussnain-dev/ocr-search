@@ -1,0 +1,10 @@
+streamlit>=1.40
+pytesseract>=0.3.10
+opencv-python-headless>=4.9
+numpy
+pillow
+pandas
+httpx>=0.27
+rank-bm25>=0.2.2
+ddgs>=9.0
+fpdf2>=2.7

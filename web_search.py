@@ -1,0 +1,105 @@
+"""Free multi-source search (no API keys): Wikipedia, DuckDuckGo web, arXiv."""
+from __future__ import annotations
+
+import re
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
+import httpx
+
+HEADERS = {"User-Agent": "OCRSearchFYP/1.0 (university final-year project)"}
+TIMEOUT = httpx.Timeout(12.0)
+ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+@dataclass
+class Doc:
+    source: str  # "Wikipedia" | "Web" | "arXiv"
+    title: str
+    url: str
+    text: str
+    coverage: float = 0.0   # share of query words found in the document
+    relevance: float = 0.0  # BM25 + coverage
+    score: float = 0.0      # relevance + source credibility
+
+
+def _clean(s: str | None) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s or "")).strip()
+
+
+def wikipedia(query: str, lang: str = "en", n: int = 3) -> list[Doc]:
+    api = f"https://{lang}.wikipedia.org/w/api.php"
+    with httpx.Client(headers=HEADERS, timeout=TIMEOUT) as c:
+        r = c.get(api, params={"action": "query", "list": "search", "srsearch": query[:300],
+                               "srlimit": n, "format": "json"})
+        r.raise_for_status()
+        titles = [h["title"] for h in r.json().get("query", {}).get("search", [])]
+        if not titles:
+            return []
+        r = c.get(api, params={"action": "query", "prop": "extracts|info", "exintro": 1,
+                               "explaintext": 1, "exsentences": 10, "exlimit": "max",
+                               "inprop": "url", "redirects": 1, "titles": "|".join(titles),
+                               "format": "json"})
+        r.raise_for_status()
+        pages = r.json().get("query", {}).get("pages", {}).values()
+    return [Doc("Wikipedia", p["title"], p.get("fullurl", ""), _clean(p.get("extract")))
+            for p in pages if p.get("extract")]
+
+
+def web(query: str, n: int = 6) -> list[Doc]:
+    try:
+        from ddgs import DDGS
+    except ImportError:  # older package name
+        from duckduckgo_search import DDGS
+    with DDGS() as d:
+        hits = list(d.text(query[:300], max_results=n))
+    return [Doc("Web", _clean(h.get("title")), h.get("href", ""), _clean(h.get("body")))
+            for h in hits if h.get("body")]
+
+
+def arxiv(keywords: list[str], n: int = 3) -> list[Doc]:
+    words = [w for w in keywords if w.isascii()][:4]
+    if not words:
+        return []
+    docs: list[Doc] = []
+    with httpx.Client(headers=HEADERS, timeout=TIMEOUT) as c:
+        for joiner in (" AND ", " OR "):  # strict first, then lenient
+            q = joiner.join(f"all:{w}" for w in words)
+            r = c.get("https://export.arxiv.org/api/query", params={"search_query": q, "max_results": n})
+            r.raise_for_status()
+            for e in ET.fromstring(r.text).findall(f"{ATOM}entry"):
+                docs.append(Doc("arXiv", _clean(e.findtext(f"{ATOM}title")),
+                                _clean(e.findtext(f"{ATOM}id")), _clean(e.findtext(f"{ATOM}summary"))))
+            if docs:
+                break
+    return docs
+
+
+def search_all(query: str, keywords: list[str], sources: list[str], wiki_lang: str = "en"):
+    """Query all chosen sources in parallel. Returns (documents, per-source report)."""
+    jobs = {}
+    if "Wikipedia" in sources:
+        jobs["Wikipedia"] = lambda: wikipedia(query, wiki_lang)
+    if "Web" in sources:
+        jobs["Web"] = lambda: web(query)
+    if "arXiv" in sources and wiki_lang == "en":
+        jobs["arXiv"] = lambda: arxiv(keywords)
+
+    def timed(name, fn):
+        t0 = time.time()
+        try:
+            out, err = fn(), ""
+        except Exception as e:  # one failing source must never break the others
+            out, err = [], f"{type(e).__name__}: {str(e)[:120]}"
+        return name, out, err, round(time.time() - t0, 2)
+
+    docs: list[Doc] = []
+    report = []
+    with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
+        for fut in [ex.submit(timed, n, f) for n, f in jobs.items()]:
+            name, out, err, secs = fut.result()
+            docs += out
+            report.append({"source": name, "found": len(out), "seconds": secs, "error": err})
+    return docs, report
