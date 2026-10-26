@@ -1,4 +1,4 @@
-"""SQLite storage for scan history and analytics (no login: history is keyed by a session id)."""
+"""SQLite storage for scan history, feedback and analytics (no login: history is keyed by a session id)."""
 from __future__ import annotations
 
 import json
@@ -22,17 +22,27 @@ def init() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT, sid TEXT, created TEXT, lang TEXT,
             ocr_conf REAL, query TEXT, ocr_text TEXT, answer TEXT, confidence REAL,
             elapsed REAL, sources TEXT, sources_used TEXT)""")
+        have = {r[1] for r in c.execute("PRAGMA table_info(scans)")}
+        for col, typ in (("feedback", "INTEGER"), ("timings", "TEXT")):  # upgrade older databases
+            if col not in have:
+                c.execute(f"ALTER TABLE scans ADD COLUMN {col} {typ}")
 
 
-def add(sid: str, rec: dict) -> None:
+def add(sid: str, rec: dict) -> int:
     with closing(_conn()) as c, c:
-        c.execute(
-            "INSERT INTO scans (sid, created, lang, ocr_conf, query, ocr_text, answer, confidence, elapsed, sources, sources_used)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        cur = c.execute(
+            "INSERT INTO scans (sid, created, lang, ocr_conf, query, ocr_text, answer, confidence, elapsed,"
+            " sources, sources_used, timings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (sid, datetime.now().strftime("%Y-%m-%d %H:%M"), rec["lang"], rec["ocr_conf"], rec["query"],
              rec["text"], rec["answer"], rec["confidence"], rec["elapsed"],
              json.dumps([{"title": d["title"], "url": d["url"], "source": d["source"]} for d in rec["docs"]]),
-             ",".join(sorted({d["source"] for d in rec["docs"]}))))
+             ",".join(sorted({d["source"] for d in rec["docs"]})), json.dumps(rec.get("timings", {}))))
+        return cur.lastrowid
+
+
+def set_feedback(scan_id: int, value: int) -> None:
+    with closing(_conn()) as c, c:
+        c.execute("UPDATE scans SET feedback=? WHERE id=?", (int(value), scan_id))
 
 
 def history(sid: str, limit: int = 50) -> list[dict]:
@@ -56,4 +66,5 @@ def stats() -> pd.DataFrame:
     """Anonymous aggregate data only (no scanned text)."""
     with closing(_conn()) as c:
         return pd.read_sql_query(
-            "SELECT created, lang, ocr_conf, confidence, elapsed, sources_used FROM scans ORDER BY id", c)
+            "SELECT created, lang, ocr_conf, confidence, elapsed, sources_used, feedback, timings"
+            " FROM scans ORDER BY id", c)

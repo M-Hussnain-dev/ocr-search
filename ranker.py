@@ -1,6 +1,7 @@
 """Query building, ranking, sentence selection and confidence score."""
 from __future__ import annotations
 
+import html
 import re
 from collections import Counter
 
@@ -13,7 +14,7 @@ when where why how""".split())
 
 TOKEN = re.compile(r"\w+", re.UNICODE)
 SENT = re.compile(r"(?<=[.!?۔؟])\s+")
-CREDIBILITY = {"arXiv": 1.0, "Wikipedia": 0.9, "Web": 0.75}
+CREDIBILITY = {"arXiv": 1.0, "OpenAlex": 0.95, "Wikipedia": 0.9, "Web": 0.75}
 
 
 def tokenize(text: str) -> list[str]:
@@ -93,12 +94,41 @@ def top_sentences(query: str, docs: list, n: int = 5, per_doc: int = 2) -> list[
     return [(c[1], c[3]) for c in chosen]
 
 
-def confidence(docs: list) -> int:
-    """0-100 heuristic: query coverage + agreement between sources + source credibility."""
+def confidence_parts(docs: list) -> dict:
+    """The three ingredients of the confidence score, each between 0 and 1."""
     if not docs:
-        return 0
+        return {"coverage": 0.0, "agreement": 0.0, "credibility": 0.0}
     top3 = docs[:3]
-    coverage = sum(d.coverage for d in top3) / len(top3)
-    diversity = min(len({d.source for d in docs[:5]}) / 2, 1.0)
-    cred = sum(CREDIBILITY.get(d.source, 0.7) for d in top3) / len(top3)
-    return round(100 * (0.55 * coverage + 0.25 * diversity + 0.20 * cred))
+    return {
+        "coverage": sum(d.coverage for d in top3) / len(top3),
+        "agreement": min(len({d.source for d in docs[:5]}) / 2, 1.0),
+        "credibility": sum(CREDIBILITY.get(d.source, 0.7) for d in top3) / len(top3),
+    }
+
+
+def confidence(docs: list) -> int:
+    """0-100 heuristic: 55% query coverage + 25% agreement between sources + 20% credibility."""
+    p = confidence_parts(docs)
+    return round(100 * (0.55 * p["coverage"] + 0.25 * p["agreement"] + 0.20 * p["credibility"]))
+
+
+def analyze_text(text: str) -> dict:
+    flat = re.sub(r"\s+", " ", text).strip()
+    words = flat.split()
+    sentences = [s for s in SENT.split(flat) if s.strip()]
+    kind = "Question" if flat.endswith(("?", "؟")) else "Short phrase" if len(words) < 6 else "Passage"
+    return {
+        "words": len(words), "sentences": len(sentences), "chars": len(flat),
+        "language": "Urdu" if is_urdu(flat) else "English", "kind": kind,
+        "keywords": keywords(flat, 8), "reading_min": max(1, round(len(words) / 200)),
+    }
+
+
+def highlight(text: str, terms) -> str:
+    """HTML-escape text and wrap words that start with a query term in <mark>."""
+    out = html.escape(text)
+    terms = sorted({t for t in terms if len(t) > 2 and t not in {"amp", "quot"}}, key=len, reverse=True)
+    if not terms:
+        return out
+    pat = re.compile(r"(?<![&\w])((?:" + "|".join(re.escape(t) for t in terms) + r")\w*)", re.I | re.UNICODE)
+    return pat.sub(r"<mark>\1</mark>", out)

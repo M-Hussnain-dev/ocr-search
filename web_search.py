@@ -1,4 +1,4 @@
-"""Free multi-source search (no API keys): Wikipedia, DuckDuckGo web, arXiv."""
+"""Free multi-source search (no API keys): Wikipedia, DuckDuckGo web, arXiv, OpenAlex."""
 from __future__ import annotations
 
 import re
@@ -16,7 +16,7 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 
 @dataclass
 class Doc:
-    source: str  # "Wikipedia" | "Web" | "arXiv"
+    source: str  # "Wikipedia" | "Web" | "arXiv" | "OpenAlex"
     title: str
     url: str
     text: str
@@ -77,6 +77,30 @@ def arxiv(keywords: list[str], n: int = 3) -> list[Doc]:
     return docs
 
 
+def _abstract(inverted: dict | None) -> str:
+    """OpenAlex stores abstracts as {word: [positions]}; rebuild the sentence."""
+    if not inverted:
+        return ""
+    pos = {i: w for w, idxs in inverted.items() for i in idxs}
+    return " ".join(pos[i] for i in sorted(pos))
+
+
+def openalex(query: str, n: int = 3) -> list[Doc]:
+    with httpx.Client(headers=HEADERS, timeout=TIMEOUT) as c:
+        r = c.get("https://api.openalex.org/works",
+                  params={"search": query[:300], "per-page": n,
+                          "select": "id,title,abstract_inverted_index,doi,publication_year"})
+        r.raise_for_status()
+        results = r.json().get("results", [])
+    docs = []
+    for w in results:
+        text = _abstract(w.get("abstract_inverted_index"))
+        if text:
+            title = f"{w.get('title') or 'Untitled'} ({w.get('publication_year') or 'n.d.'})"
+            docs.append(Doc("OpenAlex", _clean(title), w.get("doi") or w.get("id") or "", _clean(text)))
+    return docs
+
+
 def search_all(query: str, keywords: list[str], sources: list[str], wiki_lang: str = "en"):
     """Query all chosen sources in parallel. Returns (documents, per-source report)."""
     jobs = {}
@@ -86,6 +110,8 @@ def search_all(query: str, keywords: list[str], sources: list[str], wiki_lang: s
         jobs["Web"] = lambda: web(query)
     if "arXiv" in sources and wiki_lang == "en":
         jobs["arXiv"] = lambda: arxiv(keywords)
+    if "OpenAlex" in sources and wiki_lang == "en":
+        jobs["OpenAlex"] = lambda: openalex(query)
 
     def timed(name, fn):
         t0 = time.time()

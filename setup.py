@@ -4,6 +4,8 @@ One-command setup for OCR Search.
 
     python setup.py            install everything and prepare the project
     python setup.py --run      same, then start the app
+    python setup.py --test     same, then run the automated tests
+    python setup.py --key      save your Gemini API key on this computer (never upload that file)
 """
 import platform
 import re
@@ -91,7 +93,24 @@ def ensure_languages(tess):
             download(l, ROOT / "tessdata")
 
 
+def save_key():
+    import getpass
+    key = getpass.getpass("Paste your Gemini API key (hidden while typing): ").strip()
+    if not key:
+        print("No key entered.")
+        return
+    folder = ROOT / ".streamlit"
+    folder.mkdir(exist_ok=True)
+    f = folder / "secrets.toml"
+    lines = [l for l in f.read_text().splitlines() if not l.startswith("GEMINI_API_KEY")] if f.exists() else []
+    f.write_text("\n".join(lines + [f'GEMINI_API_KEY = "{key}"']) + "\n")
+    print(f"Saved to {f}\nKeep this file on your computer only: never upload the .streamlit folder to GitHub.")
+
+
 def main():
+    if "--key" in sys.argv:
+        save_key()
+        return
     if sys.version_info < (3, 9):
         sys.exit("Python 3.9 or newer is required.")
     install_python_packages()
@@ -111,6 +130,8 @@ def main():
     print("  ready")
 
     print("\nSetup finished. Start the app with:\n    streamlit run app.py\n")
+    if "--test" in sys.argv:
+        subprocess.call([sys.executable, "test_system.py"], cwd=ROOT)
     if "--run" in sys.argv:
         subprocess.call([sys.executable, "-m", "streamlit", "run", "app.py"], cwd=ROOT)
 
