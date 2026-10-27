@@ -48,6 +48,7 @@ class OcrResult:
     thumb_png: bytes     # small copy of the original
     words: int
     kind: str = "Tesseract"  # Tesseract | RapidOCR | Gemini | Ollama | Text layer (digital PDF)
+    detail: str = ""         # e.g. which Gemini model answered, or why a fallback was used
 
 
 @dataclass
@@ -64,6 +65,7 @@ class Engine:
     name: str = "Tesseract"
     gemini_key: str = ""
     gemini_model: str = "auto"
+    gemini_speed: str = "Fast"
     ollama_model: str = ""
     ollama_host: str = "http://localhost:11434"
 
@@ -278,11 +280,12 @@ def run_rapid(img: Image.Image, mode: str = HANDWRITING) -> OcrResult:
                      buf.tobytes() if ok else b"", _overlay(proc, boxes), _thumb(img), len(text.split()), "RapidOCR")
 
 
-def _jpeg_b64(img: Image.Image, side: int = 2000) -> str:
+def _jpeg_b64(img: Image.Image, side: int = 1568, quality: int = 82) -> str:
+    """Smaller upload = faster Gemini. 1568 px is plenty to read handwriting."""
     im = ImageOps.exif_transpose(img).convert("RGB")
     im.thumbnail((side, side))
     buf = io.BytesIO()
-    im.save(buf, "JPEG", quality=90)
+    im.save(buf, "JPEG", quality=quality, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -292,13 +295,25 @@ def _ai_result(text: str, img: Image.Image, t0: float, kind: str) -> OcrResult:
     return OcrResult(text, -1.0, round(time.time() - t0, 2), b"", th, th, len(text.split()), kind)
 
 
-def run_gemini(img: Image.Image, api_key: str, model: str = "auto") -> OcrResult:
+def run_gemini(img: Image.Image, api_key: str, model: str = "auto", speed: str = "Fast") -> OcrResult:
     """Google Gemini vision (free API key). Best accuracy on handwriting, cursive and Urdu."""
     import gemini
     t0 = time.time()
-    text, _used = gemini.generate(api_key, [{"text": AI_PROMPT},
-                                            {"inline_data": {"mime_type": "image/jpeg", "data": _jpeg_b64(img)}}], model)
-    return _ai_result(text, img, t0, "Gemini")
+    text, used = gemini.generate(api_key, [{"text": AI_PROMPT},
+                                           {"inline_data": {"mime_type": "image/jpeg", "data": _jpeg_b64(img)}}], model, speed=speed)
+    res = _ai_result(text, img, t0, "Gemini")
+    res.detail = used
+    return res
+
+
+def _fallback(img: Image.Image, lang_label: str, why: Exception) -> OcrResult:
+    """If Gemini is rate-limited or offline, keep working with a local engine."""
+    if rapid_available() and "urd" not in LANGS[lang_label]:
+        res = run_rapid(img, HANDWRITING)
+    else:
+        res = run_ocr(img, lang_label, MODES[0])
+    res.detail = f"Gemini unavailable ({str(why)[:90]}); used {res.kind} instead"
+    return res
 
 
 def run_ollama(img: Image.Image, model: str, host: str = "http://localhost:11434") -> OcrResult:
@@ -319,7 +334,10 @@ def read_image(img: Image.Image, lang_label: str, mode: str, eng: Engine) -> Ocr
     if name == "RapidOCR":
         return run_rapid(img, mode)
     if name == "Gemini":
-        return run_gemini(img, eng.gemini_key, eng.gemini_model)
+        try:
+            return run_gemini(img, eng.gemini_key, eng.gemini_model, eng.gemini_speed)
+        except Exception as e:
+            return _fallback(img, lang_label, e)
     if name == "Ollama":
         return run_ollama(img, eng.ollama_model, eng.ollama_host)
 
@@ -335,7 +353,7 @@ def read_image(img: Image.Image, lang_label: str, mode: str, eng: Engine) -> Ocr
             pass
     if best.confidence < 65 and eng.gemini_key:
         try:
-            best = run_gemini(img, eng.gemini_key, eng.gemini_model)
+            best = run_gemini(img, eng.gemini_key, eng.gemini_model, eng.gemini_speed)
         except Exception:
             pass
     return best

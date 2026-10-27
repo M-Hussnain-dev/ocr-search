@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import time
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 import httpx
@@ -101,8 +101,9 @@ def openalex(query: str, n: int = 3) -> list[Doc]:
     return docs
 
 
-def search_all(query: str, keywords: list[str], sources: list[str], wiki_lang: str = "en"):
-    """Query all chosen sources in parallel. Returns (documents, per-source report)."""
+def search_all(query: str, keywords: list[str], sources: list[str], wiki_lang: str = "en", deadline: float = 10.0):
+    """Query all chosen sources in parallel and stop waiting after `deadline` seconds.
+    A slow source is skipped instead of holding everything up. Returns (documents, per-source report)."""
     jobs = {}
     if "Wikipedia" in sources:
         jobs["Wikipedia"] = lambda: wikipedia(query, wiki_lang)
@@ -123,9 +124,14 @@ def search_all(query: str, keywords: list[str], sources: list[str], wiki_lang: s
 
     docs: list[Doc] = []
     report = []
-    with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
-        for fut in [ex.submit(timed, n, f) for n, f in jobs.items()]:
-            name, out, err, secs = fut.result()
-            docs += out
-            report.append({"source": name, "found": len(out), "seconds": secs, "error": err})
+    ex = ThreadPoolExecutor(max_workers=max(1, len(jobs)))
+    futures = {ex.submit(timed, n, f): n for n, f in jobs.items()}
+    done, pending = wait(futures, timeout=deadline)
+    for fut in done:
+        name, out, err, secs = fut.result()
+        docs += out
+        report.append({"source": name, "found": len(out), "seconds": secs, "error": err})
+    for fut in pending:
+        report.append({"source": futures[fut], "found": 0, "seconds": deadline, "error": f"skipped: no answer within {deadline:.0f}s"})
+    ex.shutdown(wait=False, cancel_futures=True)
     return docs, report

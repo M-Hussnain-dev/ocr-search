@@ -83,13 +83,28 @@ for k, v in {"result": None, "sample": None, "bench": None, "own_bench": None}.i
 
 # ───────────────────────── cached helpers ─────────────────────────
 @st.cache_data(show_spinner=False, max_entries=10)
-def cached_doc(files: tuple, lang: str, mode: str, eng: str, gem_key: str, gem_model: str, oll_model: str):
-    return ocr.ocr_document(files, lang, mode, ocr.Engine(eng, gem_key, gem_model, oll_model))
+def cached_doc(files: tuple, lang: str, mode: str, eng: str, gem_key: str, gem_model: str, gem_speed: str, oll_model: str):
+    return ocr.ocr_document(files, lang, mode, ocr.Engine(eng, gem_key, gem_model, gem_speed, oll_model))
+
+
+@st.cache_resource(show_spinner=False)
+def warm_gemini(key: str, speed: str) -> bool:
+    """Look up the best Gemini model in the background so the first real request does not wait for it."""
+    import threading
+    import gemini
+
+    def work():
+        try:
+            gemini.candidates(key, speed)
+        except Exception:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+    return True
 
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=50)
-def cached_search(query: str, kws: tuple, sources: tuple, wiki_lang: str):
-    return search.search_all(query, list(kws), list(sources), wiki_lang)
+def cached_search(query: str, kws: tuple, sources: tuple, wiki_lang: str, deadline: float = 10.0):
+    return search.search_all(query, list(kws), list(sources), wiki_lang, deadline)
 
 
 def esc(s: str) -> str:
@@ -106,44 +121,50 @@ def secret(name: str) -> str:
 
 
 # ───────────────────────── pipeline ─────────────────────────
-def run_pipeline(doc, text, query, lang_label, sources, max_docs, ans_mode, model, key, gem=("", "auto")):
+def run_pipeline(doc, text, query, lang_label, sources, max_docs, ans_mode, model, key,
+                 gem=("", "auto", "Fast"), deadline=10.0):
     timings = {"OCR": round(max(doc.seconds, 0), 2)}
     t_start = time.time()
     with st.status("Working on it…", expanded=True) as status:
         st.write("Searching your sources in parallel")
         t = time.time()
         wiki_lang = "ur" if rank.is_urdu(text) else "en"
-        docs, report = cached_search(query, tuple(rank.keywords(query)), tuple(sources), wiki_lang)
+        docs, report = cached_search(query, tuple(rank.keywords(query)), tuple(sources), wiki_lang, deadline)
         timings["Search"] = round(time.time() - t, 2)
-        st.write(f"Found {len(docs)} documents")
-
+        slow = [r["source"] for r in report if str(r["error"]).startswith("skipped")]
+        st.write(f"Found {len(docs)} documents" + (f" (skipped slow sources: {', '.join(slow)})" if slow else ""))
         st.write("Ranking by relevance and source credibility")
         t = time.time()
         ranked = rank.rank_documents(query, docs)[:max_docs]
         timings["Ranking"] = round(time.time() - t, 2)
+        status.update(label="Sources ready", state="complete", expanded=False)
 
-        st.write("Writing the answer")
-        t = time.time()
-        mode_used = "Smart summary"
-        if not ranked:
-            reply = ("No matching sources were found. Try editing the search query, using fewer or different "
-                     "words, or enabling more sources.")
-        elif ans_mode.startswith("Gemini") and gem[0]:
-            try:
-                reply, used = answer.gemini_answer(text, ranked, gem[0], gem[1])
-                mode_used = f"Gemini · {used}"
-            except Exception:
-                reply = answer.extractive(query, ranked)
-        elif ans_mode.startswith("Local") and model:
-            try:
-                reply = answer.ollama_answer(text, ranked, model)
-                mode_used = f"Ollama · {model}"
-            except Exception:
-                reply = answer.extractive(query, ranked)
-        else:
+    t = time.time()
+    mode_used = "Smart summary"
+    if not ranked:
+        reply = ("No matching sources were found. Try editing the search query, using fewer or different "
+                 "words, or enabling more sources.")
+    elif ans_mode.startswith("Gemini") and gem[0]:
+        info: dict = {}
+        holder = st.empty()  # the answer appears word by word, then the final card replaces it
+        try:
+            with holder.container():
+                st.markdown("##### Answer (writing…)")
+                reply = st.write_stream(answer.gemini_stream(text, ranked, gem[0], gem[1], speed=gem[2], info=info))
+            mode_used = f"Gemini · {info.get('model', '')}"
+        except Exception:
             reply = answer.extractive(query, ranked)
-        timings["Answer"] = round(time.time() - t, 2)
-        status.update(label="Done", state="complete", expanded=False)
+            mode_used = "Smart summary (Gemini unavailable)"
+        holder.empty()
+    elif ans_mode.startswith("Local") and model:
+        try:
+            reply = answer.ollama_answer(text, ranked, model)
+            mode_used = f"Ollama · {model}"
+        except Exception:
+            reply = answer.extractive(query, ranked)
+    else:
+        reply = answer.extractive(query, ranked)
+    timings["Answer"] = round(time.time() - t, 2)
 
     result = {
         "key": key, "text": text, "query": query, "answer": reply, "mode": mode_used,
@@ -177,12 +198,18 @@ def sidebar() -> dict:
                                          "and Urdu results. The image is sent to Google when this engine is used.")
             gem_model = st.text_input("Gemini model", value="auto",
                                       help="'auto' picks the newest free Flash model your key can use. Type a model name to force one.")
+            gem_speed = st.selectbox("Gemini speed", ["Fast", "Accurate"],
+                                     help="Fast uses the lighter Flash-Lite models, usually 2 to 3 times quicker. "
+                                          "Accurate uses the full Flash model, better on messy handwriting.")
             if gem_key:
                 st.success("Gemini key loaded")
+                warm_gemini(gem_key, gem_speed)
             oll_model = st.selectbox("Ollama vision model", models) if models else ""
         sources = st.multiselect("Search sources", list(SOURCE_LABEL), default=list(SOURCE_LABEL),
                                  format_func=SOURCE_LABEL.get)
         max_docs = st.slider("Sources to use", 3, 10, 6)
+        depth = st.radio("Search depth", ["Fast (about 6 s)", "Thorough (up to 14 s)"], horizontal=True,
+                         help="Slow sources are skipped after this time instead of making you wait.")
         opts = ["Smart summary (free, no AI model)"] + (["Gemini AI answer (uses your key)"] if gem_key else []) + \
                (["Local AI (Ollama)"] if models else [])
         ans_mode = st.radio("Answer style", opts)
@@ -216,7 +243,8 @@ def sidebar() -> dict:
             st.warning(f"Language data missing: {', '.join(sorted(needed - ocr.installed_langs()))}.")
         st.caption(f"**{PROJECT['title']}**  \nStudent: {PROJECT['student']} ({PROJECT['reg_no']})  \n"
                    f"Supervisor: {PROJECT['supervisor']}  \n{PROJECT['department']}")
-    return dict(lang=lang, mode=mode, engine=engine, gem_key=gem_key, gem_model=gem_model, oll_model=oll_model,
+    return dict(lang=lang, mode=mode, engine=engine, gem_key=gem_key, gem_model=gem_model, gem_speed=gem_speed,
+                oll_model=oll_model, deadline=6.0 if depth.startswith("Fast") else 14.0,
                 text_type=text_type, sources=sources, max_docs=max_docs, ans_mode=ans_mode, model=model)
 
 
@@ -293,7 +321,7 @@ def tab_scan(cfg: dict):
     try:
         with st.spinner("Reading the text…"):
             doc = cached_doc(tuple(files), cfg["lang"], cfg["mode"], cfg["engine"], cfg["gem_key"],
-                             cfg["gem_model"], cfg["oll_model"] or "")
+                             cfg["gem_model"], cfg["gem_speed"], cfg["oll_model"] or "")
     except Exception as e:
         st.error(f"Could not read this file: {e}")
         return
@@ -311,7 +339,11 @@ def tab_scan(cfg: dict):
         c[1].metric("Words read", doc.words)
         c[2].metric("Pages", len(doc.pages))
         c[3].metric("OCR time", f"{doc.seconds}s")
-        st.caption("Engine: " + ", ".join(sorted({p.kind for p in doc.pages})))
+        details = sorted({p.detail for p in doc.pages if p.detail})
+        st.caption("Engine: " + ", ".join(sorted({p.kind for p in doc.pages})) + (" · " + "; ".join(details) if details else ""))
+        for d in details:
+            if d.startswith("Gemini unavailable"):
+                st.warning(d)
         if not doc.text:
             st.warning("No text was found. Try another engine, 'Handwritten' mode, or a clearer photo.")
         elif 0 <= doc.confidence < 60:
@@ -324,6 +356,8 @@ def tab_scan(cfg: dict):
         st.markdown("".join(f'<span class="chip">{esc(x)}</span>' for x in
                             [info["language"], info["kind"], f"{info['words']} words", f"{info['sentences']} sentences"]
                             + [f"#{k}" for k in info["keywords"][:6]]), unsafe_allow_html=True)
+        with st.expander("Copy the text"):
+            st.code(text, language=None)
         qkey = hashlib.md5(text.encode()).hexdigest()[:8]
         query = st.text_input("Search query (built from your text, editable)", value=rank.build_query(text),
                               key=f"q_{key}_{qkey}")
@@ -343,7 +377,7 @@ def tab_scan(cfg: dict):
     if go:
         st.session_state.result = run_pipeline(doc, text, query.strip(), cfg["lang"], cfg["sources"], cfg["max_docs"],
                                                cfg["ans_mode"], cfg["model"], key,
-                                               (cfg["gem_key"], cfg["gem_model"]))
+                                               (cfg["gem_key"], cfg["gem_model"], cfg["gem_speed"]), cfg["deadline"])
     r = st.session_state.result
     if r and r["key"] == key:
         render_result(r)
@@ -448,7 +482,7 @@ def tab_eval(cfg: dict):
         engines = st.multiselect("Engines to compare", avail, default=avail[:2])
         if st.button("Compare", disabled=not (f and truth.strip() and engines)):
             with st.spinner("Running OCR with each engine and cleaning mode…"):
-                eng = [ocr.Engine(n, cfg["gem_key"], cfg["gem_model"]) for n in engines]
+                eng = [ocr.Engine(n, cfg["gem_key"], cfg["gem_model"], cfg["gem_speed"]) for n in engines]
                 st.session_state.own_bench = ev.benchmark_image(Image.open(f), truth, cfg["lang"], "Your image", eng)
     if st.session_state.bench is not None:
         st.markdown("##### Benchmark results")

@@ -140,57 +140,119 @@ def bad_file_rejected():
 
 
 class MockGemini:
-    """Local stand-in for the Gemini API: lists models, retires one, answers with another."""
-    @staticmethod
-    def start():
+    """Local stand-in for the Gemini API. Records every request so tests can inspect it."""
+    log: list = []
+
+    @classmethod
+    def start(cls, models=None):
         import json, threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
+        models = models or [("gemini-3.6-flash", ["generateContent"]), ("gemini-3-flash-preview", ["generateContent"]),
+                            ("gemini-3.1-flash-lite", ["generateContent"]), ("gemini-3.6-flash-tts", ["generateContent"]),
+                            ("gemini-embedding-001", ["embedContent"])]
+        cls.log = []
 
         class H(BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
 
             def do_GET(self):
-                models = [("gemini-3.6-flash", ["generateContent"]), ("gemini-3-flash-preview", ["generateContent"]),
-                          ("gemini-3.6-flash-tts", ["generateContent"]), ("gemini-embedding-001", ["embedContent"]),
-                          ("gemini-3.1-flash-lite", ["generateContent"])]
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(json.dumps({"models": [{"name": f"models/{n}", "supportedGenerationMethods": m} for n, m in models]}).encode())
 
             def do_POST(self):
-                self.rfile.read(int(self.headers.get("content-length", 0)))
-                assert self.headers.get("x-goog-api-key") == "test-key"
-                if "gemini-3.6-flash:" in self.path:  # pretend the newest model is retired
+                body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+                name = self.path.split("/")[-1].split(":")[0]
+                cfg = body.get("generationConfig", {})
+                cls.log.append((name, cfg.get("thinkingConfig")))
+                if name == "gemini-3.6-flash":  # pretend this model was retired
                     self.send_response(404)
                     self.end_headers()
                     self.wfile.write(b'{"error":{"message":"model not found"}}')
                     return
+                if name == "gemini-2.5-flash" and "thinkingConfig" in cfg:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":{"message":"Thinking config is not supported for this model"}}')
+                    return
                 self.send_response(200)
                 self.end_headers()
-                self.wfile.write(json.dumps({"candidates": [{"content": {"parts": [{"text": f"answer from {self.path.split('/')[-1].split(':')[0]}"}]}}]}).encode())
+                if "stream" in self.path:
+                    for piece in ("Hel", "lo"):
+                        self.wfile.write(f'data: {json.dumps({"candidates": [{"content": {"parts": [{"text": piece}]}}]})}\n\n'.encode())
+                else:
+                    self.wfile.write(json.dumps({"candidates": [{"content": {"parts": [{"text": f"answer from {name}"}]}}]}).encode())
 
         srv = HTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         return srv
 
 
-@test
-def gemini_auto_model_and_fallback():
+def _mock_gemini(models=None):
     import gemini
-    srv = MockGemini.start()
+    srv = MockGemini.start(models)
     old = gemini.BASE
     gemini.BASE = f"http://127.0.0.1:{srv.server_port}/v1beta"
-    gemini._cache.clear()
+    gemini._models.clear()
+    gemini._good.clear()
+    gemini._no_think.clear()
+    return gemini, srv, old
+
+
+@test
+def gemini_model_order_fast_vs_accurate():
+    gemini, srv, old = _mock_gemini()
     try:
-        assert gemini.candidates("test-key") == ("gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview")
-        text, used = gemini.generate("test-key", [{"text": "hi"}])
-        assert used == "gemini-3.1-flash-lite" and "answer from" in text   # skipped the retired model
+        assert gemini.candidates("test-key", "Fast") == ("gemini-3.1-flash-lite", "gemini-3.6-flash", "gemini-3-flash-preview")
+        assert gemini.candidates("test-key", "Accurate") == ("gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview")
+    finally:
+        gemini.BASE = old
+        srv.shutdown()
+
+
+@test
+def gemini_skips_retired_model_remembers_winner_and_turns_thinking_off():
+    gemini, srv, old = _mock_gemini()
+    try:
+        text, used = gemini.generate("test-key", [{"text": "hi"}], speed="Accurate")
+        assert used == "gemini-3.1-flash-lite" and text.startswith("answer from")
+        assert MockGemini.log[0][0] == "gemini-3.6-flash" and MockGemini.log[0][1] == {"thinkingLevel": "minimal"}
+        MockGemini.log.clear()
+        gemini.generate("test-key", [{"text": "again"}], speed="Accurate")
+        assert [n for n, _ in MockGemini.log] == ["gemini-3.1-flash-lite"]   # remembered: no wasted attempt
         from web_search import Doc
         ans, used = __import__("answer_writer").gemini_answer("scan text", [Doc("Web", "T", "u", "body")], "test-key")
         assert ans.startswith("answer from")
+    finally:
+        gemini.BASE = old
+        srv.shutdown()
+
+
+@test
+def gemini_retries_without_thinking_when_rejected():
+    gemini, srv, old = _mock_gemini()
+    try:
+        text, used = gemini.generate("test-key", [{"text": "hi"}], model="gemini-2.5-flash")
+        assert used == "gemini-2.5-flash"
+        assert MockGemini.log == [("gemini-2.5-flash", {"thinkingBudget": 0}), ("gemini-2.5-flash", None)]
+        MockGemini.log.clear()
+        gemini.generate("test-key", [{"text": "again"}], model="gemini-2.5-flash")
+        assert MockGemini.log == [("gemini-2.5-flash", None)]   # rejected setting is remembered
+    finally:
+        gemini.BASE = old
+        srv.shutdown()
+
+
+@test
+def gemini_streaming_reports_model():
+    gemini, srv, old = _mock_gemini()
+    try:
+        info = {}
+        pieces = list(__import__("answer_writer").gemini_stream("scan", [__import__("web_search").Doc("Web", "T", "u", "b")], "test-key", info=info))
+        assert "".join(pieces) == "Hello" and info["model"] == "gemini-3.1-flash-lite"
         try:
-            gemini.generate("", [{"text": "hi"}])
+            list(gemini.stream("", [{"text": "x"}]))
         except gemini.GeminiError:
             pass
         else:
@@ -198,6 +260,37 @@ def gemini_auto_model_and_fallback():
     finally:
         gemini.BASE = old
         srv.shutdown()
+
+
+@test
+def gemini_failure_falls_back_to_local_ocr():
+    if not ocr.tesseract_ready():
+        raise Skip("Tesseract not installed")
+    import gemini
+    old = gemini.BASE
+    gemini.BASE = "http://127.0.0.1:9/v1beta"   # nothing listens here
+    try:
+        img = ev.make_sample_image(ev.SAMPLES["Photosynthesis"])
+        r = ocr.read_image(img, "English", ocr.MODES[0], ocr.Engine("Gemini", "k", "gemini-3.1-flash-lite"))
+        assert r.detail.startswith("Gemini unavailable") and ev.cer(ev.SAMPLES["Photosynthesis"], r.text) < 0.1
+    finally:
+        gemini.BASE = old
+
+
+@test
+def slow_search_source_is_skipped():
+    import time
+    docs_fast = [Doc("Wikipedia", "A", "https://a", "plants")]
+    old_w, old_web = ws.wikipedia, ws.web
+    ws.wikipedia = lambda q, lang="en", n=3: docs_fast
+    ws.web = lambda q, n=6: (time.sleep(3), [])[1]
+    try:
+        t0 = time.time()
+        docs, report = ws.search_all("plants", ["plants"], ["Wikipedia", "Web"], "en", deadline=0.5)
+        assert time.time() - t0 < 2 and len(docs) == 1
+        assert any(r["source"] == "Web" and r["error"].startswith("skipped") for r in report)
+    finally:
+        ws.wikipedia, ws.web = old_w, old_web
 
 
 if __name__ == "__main__":

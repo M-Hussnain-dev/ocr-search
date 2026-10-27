@@ -40,8 +40,14 @@ def ollama_answer(text: str, docs: list, model: str, host: str = "http://localho
     return r.json().get("response", "").strip()
 
 
-def gemini_answer(text: str, docs: list, api_key: str, model: str = "auto", k: int = 4) -> tuple[str, str]:
+def gemini_answer(text: str, docs: list, api_key: str, model: str = "auto", k: int = 4, speed: str = "Fast") -> tuple[str, str]:
     """Returns (answer, model_used)."""
     import gemini
-    out, used = gemini.generate(api_key, [{"text": _prompt(text, docs, k)}], model)
+    out, used = gemini.generate(api_key, [{"text": _prompt(text, docs, k)}], model, speed=speed)
     return out.strip(), used
+
+
+def gemini_stream(text: str, docs: list, api_key: str, model: str = "auto", k: int = 4, speed: str = "Fast", info: dict | None = None):
+    """Generator of answer pieces, so the page can show the answer while it is being written."""
+    import gemini
+    yield from gemini.stream(api_key, [{"text": _prompt(text, docs, k)}], model, speed=speed, info=info)
