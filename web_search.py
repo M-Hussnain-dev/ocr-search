@@ -9,7 +9,18 @@ from dataclasses import dataclass
 
 import httpx
 
-HEADERS = {"User-Agent": "OCRSearchFYP/1.0 (university final-year project)"}
+HEADERS = {"User-Agent": "OCRSearchFYP/1.0 (educational project; set CONTACT in the app) python-httpx"}
+WIKI_API = "https://{lang}.wikipedia.org/w/api.php"
+CONTACT = ""
+
+
+def set_contact(contact: str) -> None:
+    """Wikimedia requires every client to identify itself with real contact details (an email or your GitHub link)
+    or it answers '403 Please respect our robot policy'."""
+    global CONTACT
+    CONTACT = (contact or "").strip()
+    who = CONTACT or "educational project; set CONTACT in the app"
+    HEADERS["User-Agent"] = f"OCRSearchFYP/1.0 ({who}) python-httpx"
 TIMEOUT = httpx.Timeout(12.0)
 ATOM = "{http://www.w3.org/2005/Atom}"
 
@@ -29,8 +40,8 @@ def _clean(s: str | None) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s or "")).strip()
 
 
-def wikipedia(query: str, lang: str = "en", n: int = 3) -> list[Doc]:
-    api = f"https://{lang}.wikipedia.org/w/api.php"
+def _wikipedia_api(query: str, lang: str, n: int) -> list[Doc]:
+    api = WIKI_API.format(lang=lang)
     with httpx.Client(headers=HEADERS, timeout=TIMEOUT) as c:
         r = c.get(api, params={"action": "query", "list": "search", "srsearch": query[:300],
                                "srlimit": n, "format": "json"})
@@ -46,6 +57,24 @@ def wikipedia(query: str, lang: str = "en", n: int = 3) -> list[Doc]:
         pages = r.json().get("query", {}).get("pages", {}).values()
     return [Doc("Wikipedia", p["title"], p.get("fullurl", ""), _clean(p.get("extract")))
             for p in pages if p.get("extract")]
+
+
+def wikipedia(query: str, lang: str = "en", n: int = 3) -> list[Doc]:
+    """Wikipedia API. If Wikimedia refuses (403/429/503), fall back to a web search limited to Wikipedia pages."""
+    try:
+        return _wikipedia_api(query, lang, n)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code not in (403, 429, 503):
+            raise
+        try:
+            docs = web(f"{query[:200]} site:{lang}.wikipedia.org", n=n + 2)
+        except Exception:
+            raise e
+        found = [Doc("Wikipedia", re.sub(r"\s*[-|]\s*Wikipedia.*$", "", d.title), d.url, d.text)
+                 for d in docs if "wikipedia.org" in d.url]
+        if not found:
+            raise e
+        return found[:n]
 
 
 def web(query: str, n: int = 6) -> list[Doc]:
@@ -89,7 +118,8 @@ def openalex(query: str, n: int = 3) -> list[Doc]:
     with httpx.Client(headers=HEADERS, timeout=TIMEOUT) as c:
         r = c.get("https://api.openalex.org/works",
                   params={"search": query[:300], "per-page": n,
-                          "select": "id,title,abstract_inverted_index,doi,publication_year"})
+                          "select": "id,title,abstract_inverted_index,doi,publication_year",
+                          **({"mailto": CONTACT} if "@" in CONTACT else {})})
         r.raise_for_status()
         results = r.json().get("results", [])
     docs = []

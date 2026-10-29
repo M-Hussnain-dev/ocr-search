@@ -31,6 +31,9 @@ PROJECT = {
     "reg_no": "Your Reg. No.",
     "supervisor": "Supervisor Name",
     "department": "Department of Computer Science, University of Agriculture, Faisalabad",
+    # Wikipedia requires contact details in every request. Use your email or your GitHub repository link.
+    # (You can also set CONTACT in Streamlit Secrets instead.)
+    "contact": "https://github.com/your-username/ocr-search",
 }
 
 st.set_page_config(page_title="OCR Search", page_icon="🔎", layout="wide")
@@ -120,6 +123,9 @@ def secret(name: str) -> str:
     return str(v or os.environ.get(name, ""))
 
 
+search.set_contact(secret("CONTACT") or PROJECT.get("contact", ""))
+
+
 # ───────────────────────── pipeline ─────────────────────────
 def run_pipeline(doc, text, query, lang_label, sources, max_docs, ans_mode, model, key,
                  gem=("", "auto", "Fast"), deadline=10.0):
@@ -152,9 +158,10 @@ def run_pipeline(doc, text, query, lang_label, sources, max_docs, ans_mode, mode
                 st.markdown("##### Answer (writing…)")
                 reply = st.write_stream(answer.gemini_stream(text, ranked, gem[0], gem[1], speed=gem[2], info=info))
             mode_used = f"Gemini · {info.get('model', '')}"
-        except Exception:
+        except Exception as e:
             reply = answer.extractive(query, ranked)
             mode_used = "Smart summary (Gemini unavailable)"
+            st.warning(f"Gemini could not write the answer, so the free summary was used instead. Reason: {str(e)[:160]}")
         holder.empty()
     elif ans_mode.startswith("Local") and model:
         try:
@@ -212,7 +219,8 @@ def sidebar() -> dict:
                          help="Slow sources are skipped after this time instead of making you wait.")
         opts = ["Smart summary (free, no AI model)"] + (["Gemini AI answer (uses your key)"] if gem_key else []) + \
                (["Local AI (Ollama)"] if models else [])
-        ans_mode = st.radio("Answer style", opts)
+        ans_mode = st.radio("Answer style", opts, index=1 if gem_key else 0,
+                            help="With a Gemini key, Gemini writes the answer by default.")
         model = st.selectbox("Answer model", models) if ans_mode.startswith("Local") else None
 
         # resolve engine + cleaning mode from the simple choice

@@ -293,6 +293,46 @@ def slow_search_source_is_skipped():
         ws.wikipedia, ws.web = old_w, old_web
 
 
+@test
+def wikipedia_identifies_itself_and_falls_back_when_blocked():
+    import json, threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            seen.append(self.headers.get("User-Agent", ""))
+            self.send_response(403)   # what Wikimedia sends to clients without contact details
+            self.end_headers()
+            self.wfile.write(b"Please respect our robot policy https://w.wiki/4wJS")
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    old_api, old_web = ws.WIKI_API, ws.web
+    ws.WIKI_API = f"http://127.0.0.1:{srv.server_port}/w/api.php?lang={{lang}}"
+    ws.web = lambda q, n=6: [Doc("Web", "Photosynthesis - Wikipedia", "https://en.wikipedia.org/wiki/Photosynthesis", "Plants make sugar."),
+                             Doc("Web", "Other site", "https://example.com/x", "not wikipedia")]
+    try:
+        ws.set_contact("https://github.com/someone/ocr-search")
+        docs = ws.wikipedia("photosynthesis")
+        assert seen and "github.com/someone/ocr-search" in seen[0]          # identifies itself
+        assert len(docs) == 1 and docs[0].source == "Wikipedia" and docs[0].title == "Photosynthesis"
+        ws.web = lambda q, n=6: (_ for _ in ()).throw(RuntimeError("down"))   # fallback also down -> original error
+        try:
+            ws.wikipedia("photosynthesis")
+        except Exception as e:
+            assert "403" in str(e)
+        else:
+            raise AssertionError("expected the 403 error")
+    finally:
+        ws.WIKI_API, ws.web = old_api, old_web
+        ws.set_contact("")
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     failed = 0
     for fn in TESTS:
