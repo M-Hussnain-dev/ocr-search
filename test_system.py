@@ -1,6 +1,7 @@
 """Automated tests. Run:  python test_system.py   (no internet needed)"""
 import io
 import sys
+import time
 import tempfile
 from pathlib import Path
 
@@ -331,6 +332,58 @@ def wikipedia_identifies_itself_and_falls_back_when_blocked():
         ws.WIKI_API, ws.web = old_api, old_web
         ws.set_contact("")
         srv.shutdown()
+
+
+@test
+def arxiv_is_throttled_cached_and_falls_back_on_429():
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    hits = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(429)
+            self.end_headers()
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    old = (ws.ARXIV_API, ws.web, ws.ARXIV_GAP)
+    ws.ARXIV_API, ws.ARXIV_GAP = f"http://127.0.0.1:{srv.server_port}/api/query", 0.4
+    ws.web = lambda q, n=6: [Doc("Web", "Light capture in plants | arXiv.org", "https://arxiv.org/abs/1234.5678", "We study light capture."),
+                             Doc("Web", "Blog", "https://blog.example/x", "no")]
+    ws._arxiv_cache.clear()
+    try:
+        docs = ws.arxiv(["photosynthesis", "plants"])
+        assert len(hits) == 1 and "query" in hits[0]                    # a single request, not two
+        assert len(docs) == 1 and docs[0].source == "arXiv" and docs[0].title == "Light capture in plants"
+        ws.arxiv(["photosynthesis", "plants"])
+        assert len(hits) == 1                                            # second call served from the cache
+        t0 = time.time()
+        ws._arxiv_throttle()
+        ws._arxiv_throttle()
+        assert time.time() - t0 >= 0.35                                  # requests are spaced out
+    finally:
+        ws.ARXIV_API, ws.web, ws.ARXIV_GAP = old
+        srv.shutdown()
+
+
+@test
+def rate_limit_message_is_readable():
+    import httpx
+    old = ws.openalex
+
+    def busy(q, n=3):
+        raise httpx.HTTPStatusError("x", request=httpx.Request("GET", "http://x"), response=httpx.Response(429))
+    ws.openalex = busy
+    try:
+        docs, report = ws.search_all("plants", ["plants"], ["OpenAlex"], "en", deadline=5)
+        assert docs == [] and "rate-limiting" in report[0]["error"] and "HTTPStatusError" not in report[0]["error"]
+    finally:
+        ws.openalex = old
 
 
 if __name__ == "__main__":
